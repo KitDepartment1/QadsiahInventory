@@ -1,11 +1,18 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
+const mongoose = require('mongoose');
 const app = express();
 
 app.use(express.json({ limit: '50mb' }));
 app.use(cors());
+
+// MongoDB connection string (from environment or hardcoded)
+const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://lukejmurphy95_db_user:iIE6ZWZatYaJKWxi@cluster0.tdijzxo.mongodb.net/?appName=Cluster0';
+
+// Connect to MongoDB
+mongoose.connect(MONGO_URI, { dbName: 'qadsiah_inventory' })
+  .then(() => console.log('✓ Connected to MongoDB'))
+  .catch(err => console.error('✗ MongoDB connection error:', err));
 
 // User store with roles
 const users = {
@@ -17,79 +24,117 @@ const users = {
   'LukeMurphy': { password: 'Qadsiah', role: 'manager' }
 };
 
-// File paths for persistent data
-const STATE_FILE = path.join('/tmp', 'inventory-state.json');
-const SESSIONS_FILE = path.join('/tmp', 'inventory-sessions.json');
-
-// In-memory sessions (load from file on startup)
+// In-memory sessions (loaded on startup)
 let sessions = {};
 
-// Default state structure
-const defaultState = {
-  moves: [],
-  thresh: 25,
-  logo: null,
-  names: {},
-  photos: {},
-  folders: {},
-  order: [],
-  version: 0
-};
+// MongoDB Schemas
+const stateSchema = new mongoose.Schema({
+  _id: String,
+  moves: Array,
+  thresh: Number,
+  logo: String,
+  crest: String,
+  names: Object,
+  photos: Object,
+  folders: Object,
+  order: Array,
+  version: Number,
+  updatedAt: { type: Date, default: Date.now }
+});
 
-let state = defaultState;
+const sessionSchema = new mongoose.Schema({
+  token: { type: String, unique: true },
+  username: String,
+  role: String,
+  createdAt: { type: Date, default: Date.now, expires: 604800 } // 7 days TTL
+});
 
-// Load sessions from file
-function loadSessions() {
+const State = mongoose.model('State', stateSchema);
+const Session = mongoose.model('Session', sessionSchema);
+
+// Load sessions from MongoDB on startup
+async function loadSessions() {
   try {
-    if (fs.existsSync(SESSIONS_FILE)) {
-      const data = fs.readFileSync(SESSIONS_FILE, 'utf8');
-      sessions = JSON.parse(data);
-    } else {
-      sessions = {};
+    const dbSessions = await Session.find({});
+    sessions = {};
+    for (const sess of dbSessions) {
+      sessions[sess.token] = { username: sess.username, role: sess.role };
     }
+    console.log(`✓ Loaded ${Object.keys(sessions).length} sessions from MongoDB`);
   } catch (e) {
     console.error('Error loading sessions:', e);
     sessions = {};
   }
 }
 
-// Save sessions to file
-function saveSessions() {
+// Save session to MongoDB
+async function saveSession(token, username, role) {
   try {
-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2), 'utf8');
+    await Session.updateOne(
+      { token },
+      { token, username, role, createdAt: new Date() },
+      { upsert: true }
+    );
   } catch (e) {
-    console.error('Error saving sessions:', e);
+    console.error('Error saving session:', e);
   }
 }
 
-// Load state from file
-function loadState() {
+// Delete session from MongoDB
+async function deleteSession(token) {
   try {
-    if (fs.existsSync(STATE_FILE)) {
-      const data = fs.readFileSync(STATE_FILE, 'utf8');
-      state = JSON.parse(data);
-    } else {
-      state = { ...defaultState };
-      saveState();
+    await Session.deleteOne({ token });
+  } catch (e) {
+    console.error('Error deleting session:', e);
+  }
+}
+
+// Load state from MongoDB
+async function loadState() {
+  try {
+    let state = await State.findById('inventory-state');
+    if (!state) {
+      // Create default state if doesn't exist
+      state = new State({
+        _id: 'inventory-state',
+        moves: [],
+        thresh: 25,
+        logo: null,
+        crest: null,
+        names: {},
+        photos: {},
+        folders: {},
+        order: [],
+        version: 0
+      });
+      await state.save();
     }
+    return state;
   } catch (e) {
     console.error('Error loading state:', e);
-    state = { ...defaultState };
+    return null;
   }
 }
 
-// Save state to file
-function saveState() {
+// Save state to MongoDB
+async function saveState(stateData) {
   try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+    await State.updateOne(
+      { _id: 'inventory-state' },
+      { ...stateData, updatedAt: new Date() },
+      { upsert: true }
+    );
   } catch (e) {
     console.error('Error saving state:', e);
   }
 }
 
-// Load on startup
+// In-memory state cache
+let state = null;
+
+// Initialize
 loadSessions();
-loadState();
+loadState().then(s => { state = s ? s.toObject() : null; });
 
 // Middleware: verify token
 function verifyToken(req, res, next) {
@@ -117,9 +162,9 @@ app.post('/api/login', (req, res) => {
   const token = Math.random().toString(36).substring(2, 15) +
     Math.random().toString(36).substring(2, 15);
   
-  // Store session and save to file
+  // Store in memory and database
   sessions[token] = { username, role: user.role };
-  saveSessions();
+  saveSession(token, username, user.role);
   
   res.json({ ok: true, token, username, role: user.role });
 });
@@ -129,22 +174,29 @@ app.post('/api/logout', (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (token) {
     delete sessions[token];
-    saveSessions();
+    deleteSession(token);
   }
   res.json({ ok: true });
 });
 
 // Get state (protected)
 app.get('/api/state', verifyToken, (req, res) => {
+  if (!state) {
+    return res.status(500).json({ error: 'State not loaded' });
+  }
   res.json(state);
 });
 
 // Sync state with audit trail (protected)
 app.post('/api/sync', verifyToken, (req, res) => {
-  const { moves, thresh, logo, names, photos, folders, order } = req.body;
+  if (!state) {
+    return res.status(500).json({ error: 'State not loaded' });
+  }
+
+  const { moves, thresh, logo, crest, names, photos, folders, order } = req.body;
   const username = req.userId;
 
-  // Track movements with user info
+  // Update state
   if (moves !== undefined) {
     state.moves = moves.map(m => ({
       ...m,
@@ -153,13 +205,17 @@ app.post('/api/sync', verifyToken, (req, res) => {
   }
   if (thresh !== undefined) state.thresh = thresh;
   if (logo !== undefined) state.logo = logo;
+  if (crest !== undefined) state.crest = crest;
   if (names !== undefined) state.names = names;
   if (photos !== undefined) state.photos = photos;
   if (folders !== undefined) state.folders = folders;
   if (order !== undefined) state.order = order;
   
   state.version++;
-  saveState();
+  
+  // Save to MongoDB
+  saveState(state);
+  
   res.json({ ok: true, version: state.version });
 });
 
@@ -167,6 +223,9 @@ app.post('/api/sync', verifyToken, (req, res) => {
 app.get('/api/movements', verifyToken, (req, res) => {
   if (req.userRole !== 'manager') {
     return res.status(403).json({ error: 'Access denied' });
+  }
+  if (!state) {
+    return res.status(500).json({ error: 'State not loaded' });
   }
   const audit = state.moves.map(m => ({
     time: m.t,
@@ -181,6 +240,9 @@ app.get('/api/movements', verifyToken, (req, res) => {
 
 // Get audit log (protected)
 app.get('/api/audit', verifyToken, (req, res) => {
+  if (!state) {
+    return res.status(500).json({ error: 'State not loaded' });
+  }
   const audit = state.moves.map(m => ({
     time: m.t,
     user: m.user || 'unknown',
@@ -194,12 +256,11 @@ app.get('/api/audit', verifyToken, (req, res) => {
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({ status: 'ok', dbConnected: mongoose.connection.readyState === 1 });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Qadsiah Kit Room backend running on port ${PORT}`);
-  console.log(`Sessions loaded: ${Object.keys(sessions).length}`);
-  console.log(`State version: ${state.version}`);
+  console.log(`Users: admin, CreagRobertson, Rabbi, Sanula, LouayBafaqier, LukeMurphy`);
 });
