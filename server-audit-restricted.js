@@ -159,7 +159,7 @@ app.post('/api/sync', verifyToken, (req, res) => {
   if (order !== undefined) state.order = order;
   
   state.version++;
-  saveState(); // SAVE TO FILE after every sync
+  saveState();
   res.json({ ok: true, version: state.version });
 });
 
@@ -203,5 +203,3 @@ app.listen(PORT, () => {
   console.log(`Sessions loaded: ${Object.keys(sessions).length}`);
   console.log(`State version: ${state.version}`);
 });
-  console.log(`Qadsiah Kit Room backend running on port ${PORT}`);
-  console.log(
