@@ -254,6 +254,55 @@ app.get('/api/audit', verifyToken, (req, res) => {
   res.json({ audit });
 });
 
+// Create new item (managers only)
+app.post('/api/create-item', verifyToken, (req, res) => {
+  if (req.userRole !== 'manager') {
+    return res.status(403).json({ error: 'Only managers can create items' });
+  }
+  
+  if (!state) {
+    return res.status(500).json({ error: 'State not loaded' });
+  }
+  
+  const { name, code, price, folder, sizes, photo } = req.body;
+  
+  // Validate
+  if (!name || !price || !folder || !sizes || sizes.length === 0) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  
+  // Generate unique key from name and code
+  const key = `${name.toLowerCase().replace(/\s+/g, '-')}~${code || 'custom'}`;
+  const uniqueKey = key + '-' + Date.now();
+  
+  // Create new item object
+  const newItem = {
+    k: uniqueKey,
+    n: name.toUpperCase(),
+    c: code || '',
+    p: parseFloat(price),
+    g: folder,
+    i: `photo-${uniqueKey}.png`,
+    s: sizes.map(([size, qty]) => [size, parseInt(qty)])
+  };
+  
+  // Add to DATA/state (mock - in production this would update a database)
+  // For now, we'll store in the order array to signal updates
+  if (!state.order) state.order = [];
+  state.order.push(newItem.k);
+  
+  // Save photo if provided
+  if (photo) {
+    state.photos = state.photos || {};
+    state.photos[uniqueKey] = photo;
+  }
+  
+  state.version++;
+  saveState(state);
+  
+  res.json({ ok: true, item: newItem, version: state.version });
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', dbConnected: mongoose.connection.readyState === 1 });
