@@ -17,11 +17,12 @@ const users = {
   'LukeMurphy': { password: 'Qadsiah', role: 'manager' }
 };
 
-// In-memory sessions
-const sessions = {};
-
-// File path for persistent state
+// File paths for persistent data
 const STATE_FILE = path.join('/tmp', 'inventory-state.json');
+const SESSIONS_FILE = path.join('/tmp', 'inventory-sessions.json');
+
+// In-memory sessions (load from file on startup)
+let sessions = {};
 
 // Default state structure
 const defaultState = {
@@ -35,9 +36,33 @@ const defaultState = {
   version: 0
 };
 
-// Load state from file or use default
 let state = defaultState;
 
+// Load sessions from file
+function loadSessions() {
+  try {
+    if (fs.existsSync(SESSIONS_FILE)) {
+      const data = fs.readFileSync(SESSIONS_FILE, 'utf8');
+      sessions = JSON.parse(data);
+    } else {
+      sessions = {};
+    }
+  } catch (e) {
+    console.error('Error loading sessions:', e);
+    sessions = {};
+  }
+}
+
+// Save sessions to file
+function saveSessions() {
+  try {
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2), 'utf8');
+  } catch (e) {
+    console.error('Error saving sessions:', e);
+  }
+}
+
+// Load state from file
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
@@ -53,6 +78,7 @@ function loadState() {
   }
 }
 
+// Save state to file
 function saveState() {
   try {
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
@@ -61,7 +87,8 @@ function saveState() {
   }
 }
 
-// Load state on startup
+// Load on startup
+loadSessions();
 loadState();
 
 // Middleware: verify token
@@ -85,17 +112,25 @@ app.post('/api/login', (req, res) => {
   if (!user || user.password !== password) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
+  
   // Generate token
   const token = Math.random().toString(36).substring(2, 15) +
     Math.random().toString(36).substring(2, 15);
+  
+  // Store session and save to file
   sessions[token] = { username, role: user.role };
+  saveSessions();
+  
   res.json({ ok: true, token, username, role: user.role });
 });
 
 // Logout endpoint
 app.post('/api/logout', (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
-  if (token) delete sessions[token];
+  if (token) {
+    delete sessions[token];
+    saveSessions();
+  }
   res.json({ ok: true });
 });
 
@@ -113,7 +148,7 @@ app.post('/api/sync', verifyToken, (req, res) => {
   if (moves !== undefined) {
     state.moves = moves.map(m => ({
       ...m,
-      user: m.user || username // Add username to each movement if not already there
+      user: m.user || username
     }));
   }
   if (thresh !== undefined) state.thresh = thresh;
@@ -128,7 +163,7 @@ app.post('/api/sync', verifyToken, (req, res) => {
   res.json({ ok: true, version: state.version });
 });
 
-// Get audit log (managers only)
+// Get audit log (protected)
 app.get('/api/movements', verifyToken, (req, res) => {
   if (req.userRole !== 'manager') {
     return res.status(403).json({ error: 'Access denied' });
@@ -164,5 +199,9 @@ app.get('/api/health', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
+  console.log(`Qadsiah Kit Room backend running on port ${PORT}`);
+  console.log(`Sessions loaded: ${Object.keys(sessions).length}`);
+  console.log(`State version: ${state.version}`);
+});
   console.log(`Qadsiah Kit Room backend running on port ${PORT}`);
   console.log(
